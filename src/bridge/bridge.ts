@@ -4,10 +4,19 @@ import { CodexRpcError, type CodexAppServer } from "../codex/appServer.ts";
 import type { Thread, ThreadItem, ThreadSessionResponse, Turn, UserInput } from "../codex/protocol.ts";
 import type { Config } from "../config.ts";
 import { createLogger } from "../log.ts";
-import { createReplyContext, passiveRemaining, type MessageSender, type ReplyContext } from "../qq/sender.ts";
+import { QQApiError } from "../qq/api.ts";
+import {
+  canSendMedia,
+  createReplyContext,
+  MAX_IMAGE_BYTES,
+  passiveRemaining,
+  type MessageSender,
+  type ReplyContext,
+} from "../qq/sender.ts";
 import { SCENE_LABEL, type QQAttachment, type QQMessageEvent, type QQNoticeEvent, type Scene } from "../qq/types.ts";
 import { chunkText, formatDuration, LruSet, Semaphore, shortId, truncate } from "../util.ts";
 import { prepareAttachments } from "./attachments.ts";
+import { extractReplyImages } from "./images.ts";
 import { SessionStore } from "./sessions.ts";
 
 const log = createLogger("bridge");
@@ -24,8 +33,13 @@ const UNAUTHORIZED_REPLY_INTERVAL_MS = 10 * 60_000;
 /** 每个会话记住最近用过的线程数 / /threads 一次列出的数量 */
 const HISTORY_LIMIT = 20;
 const LIST_LIMIT = 10;
+/** 一次回复最多发几张图片 */
+const MAX_REPLY_IMAGES = 3;
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+/** 给用户看的失败原因：QQ 接口错误只保留平台返回的说明 */
+const reasonText = (err: unknown) =>
+  err instanceof QQApiError ? err.serverMessage || `HTTP ${err.status}` : errText(err);
 
 interface Inbound {
   scene: Scene;
@@ -74,6 +88,8 @@ class TurnRun {
   readonly conv: Conversation;
   readonly threadId: string;
   readonly release: () => void;
+  /** 本轮 Codex 的工作目录，回复里的相对路径基于它 */
+  readonly cwd: string;
   readonly startedAt = Date.now();
   /** 回复上下文：任务进行中用户追加消息时会切到最新那条（被动回复额度更新） */
   ctx: ReplyContext;
@@ -93,11 +109,12 @@ class TurnRun {
   timers: NodeJS.Timeout[] = [];
   sendChain: Promise<void> = Promise.resolve();
 
-  constructor(conv: Conversation, threadId: string, ctx: ReplyContext, release: () => void) {
+  constructor(conv: Conversation, threadId: string, ctx: ReplyContext, release: () => void, cwd: string) {
     this.conv = conv;
     this.threadId = threadId;
     this.ctx = ctx;
     this.release = release;
+    this.cwd = cwd;
   }
 }
 
@@ -872,8 +889,16 @@ export class Bridge {
       "- QQ 对 Markdown 支持有限：可以用简单的列表和代码块，不要用表格、HTML 和多级标题。",
       "- 用户看不到你执行的命令和输出，需要时在回复里简要说明做了什么、结果如何。",
       "- 用户发来的图片和文件会先保存到本机，消息里会给出本地路径。",
-      "- 生成了文件时，请告诉用户文件在本机的完整路径（暂时不能通过 QQ 直接发送文件）。",
     ];
+    if (canSendMedia(scene)) {
+      lines.push(
+        "- 想给用户发图片（比如生成的图表、截图），就在最终回复里写 `![说明](图片的绝对路径)`，程序会把图片发到 QQ。" +
+          `支持 png/jpg/gif/webp，单张不超过 ${MAX_IMAGE_BYTES / 1024 / 1024}MB，一次最多 ${MAX_REPLY_IMAGES} 张。`,
+        "- 其他文件暂时不能通过 QQ 直接发送，生成了文件时请告诉用户文件在本机的完整路径。",
+      );
+    } else {
+      lines.push("- 生成了文件时，请告诉用户文件在本机的完整路径（暂时不能通过 QQ 直接发送文件）。");
+    }
     if (scene === "group" || scene === "channel") {
       lines.push("- 这是群聊，可能有多人使用同一个会话，每条消息开头的 [群成员 xxx] 标明了发送者。");
     }
@@ -941,7 +966,7 @@ export class Bridge {
       const first = batch[0];
       const threadId = await this.#ensureThread(conv, last.scene, first.text || (first.attachments.length ? "附件" : ""));
       const input = (await Promise.all(batch.map((m) => this.#inputFor(m)))).flat();
-      run = new TurnRun(conv, threadId, last.ctx, release);
+      run = new TurnRun(conv, threadId, last.ctx, release, conv.override.cwd ?? conv.cwd ?? this.#cfg.codex.cwd);
       conv.run = run;
       this.#runs.set(threadId, run);
       void this.#sender.sendTyping(last.ctx);
@@ -1128,24 +1153,43 @@ export class Bridge {
     this.#pump(conv);
   }
 
+  /** 发送回复：回复里引用的本机图片先换成说明文字，文字发完后再逐张发图片。 */
   async #sendAnswer(run: TurnRun, text: string): Promise<void> {
     const conv = run.conv;
-    let body = text.trim();
+    const reply = extractReplyImages(text.trim(), {
+      cwd: run.cwd,
+      maxImages: MAX_REPLY_IMAGES,
+      maxBytes: MAX_IMAGE_BYTES,
+      unsupported: canSendMedia(conv.scene) ? undefined : `${SCENE_LABEL[conv.scene]}里暂不支持发图片`,
+    });
+    // 回复只有图片时不用再发一条文字
+    let body = reply.hasText ? reply.text : "";
     if (conv.notice) {
-      body = `${conv.notice}\n\n${body}`;
+      body = body ? `${conv.notice}\n\n${body}` : conv.notice;
       conv.notice = undefined;
     }
     const { maxChunkChars, maxChunks } = this.#cfg.qq;
-    let chunks = chunkText(body, maxChunkChars);
+    let chunks = body ? chunkText(body, maxChunkChars) : [];
     if (chunks.length > maxChunks) {
-      const file = this.#saveFullReply(conv, body);
+      const file = this.#saveFullReply(conv, text.trim());
       chunks = chunks.slice(0, maxChunks);
       chunks[maxChunks - 1] += `\n\n…（内容太长已截断，完整回复保存在本机：${file}）`;
     }
     for (const [i, chunk] of chunks.entries()) {
       await this.#sender.send(run.ctx, chunks.length > 1 ? `【${i + 1}/${chunks.length}】\n${chunk}` : chunk);
     }
-    log.info(`已回复（${conv.key}）：${chunks.length} 条，${body.length} 字`);
+    const failed: string[] = [];
+    for (const image of reply.images) {
+      try {
+        await this.#sender.sendImage(run.ctx, image.file);
+      } catch (err) {
+        log.warn(`发送图片失败（${conv.key}）：${image.file}`, errText(err));
+        failed.push(`⚠️ 图片「${image.alt}」发送失败（${truncate(reasonText(err), 100)}），文件在本机：${image.file}`);
+      }
+    }
+    if (failed.length) await this.#sender.send(run.ctx, failed.join("\n"));
+    const sentImages = reply.images.length ? `，图片 ${reply.images.length - failed.length}/${reply.images.length} 张` : "";
+    log.info(`已回复（${conv.key}）：${chunks.length} 条，${body.length} 字${sentImages}`);
   }
 
   #saveFullReply(conv: Conversation, text: string): string {

@@ -30,6 +30,18 @@ export interface SendResult {
   timestamp?: string;
 }
 
+/** 富媒体上传的返回值 */
+export interface UploadResult {
+  file_uuid?: string;
+  /** 发富媒体消息时原样填到 media.file_info */
+  file_info: string;
+  /** file_info 有效期（秒），0 表示长期有效 */
+  ttl?: number;
+}
+
+/** 上传文件比普通请求慢，超时放宽一些 */
+const UPLOAD_TIMEOUT_MS = 120_000;
+
 /** QQ 机器人 OpenAPI（https://api.bot.qq.com）的最小封装。 */
 export class QQApi {
   #base: string;
@@ -42,7 +54,7 @@ export class QQApi {
     this.#tokens = opts.tokens;
   }
 
-  async request<T>(method: string, path: string, body?: unknown, retryAuth = true): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, retryAuth = true, timeoutMs = 30_000): Promise<T> {
     const token = await this.#tokens.getToken();
     const res = await fetch(this.#base + path, {
       method,
@@ -52,7 +64,7 @@ export class QQApi {
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
     let data: any;
@@ -66,7 +78,7 @@ export class QQApi {
     if (res.status === 401 && retryAuth) {
       log.warn(`${method} ${path} 返回 401，刷新 token 后重试`);
       await this.#tokens.getToken(true);
-      return this.request<T>(method, path, body, false);
+      return this.request<T>(method, path, body, false, timeoutMs);
     }
     const bodyCode = data && typeof data === "object" ? (data.code ?? data.err_code) : undefined;
     const isError = !res.ok || (typeof bodyCode === "number" && bodyCode !== 0 && typeof data.message === "string" && !data.id);
@@ -97,6 +109,16 @@ export class QQApi {
 
   sendGroup(groupOpenid: string, body: object): Promise<SendResult> {
     return this.request("POST", `/v2/groups/${encodeURIComponent(groupOpenid)}/messages`, body);
+  }
+
+  /** 上传单聊富媒体，返回的 file_info 只能发到单聊 */
+  uploadC2CFile(openid: string, body: object): Promise<UploadResult> {
+    return this.request("POST", `/v2/users/${encodeURIComponent(openid)}/files`, body, true, UPLOAD_TIMEOUT_MS);
+  }
+
+  /** 上传群聊富媒体，返回的 file_info 只能发到群聊 */
+  uploadGroupFile(groupOpenid: string, body: object): Promise<UploadResult> {
+    return this.request("POST", `/v2/groups/${encodeURIComponent(groupOpenid)}/files`, body, true, UPLOAD_TIMEOUT_MS);
   }
 
   sendChannel(channelId: string, body: object): Promise<SendResult> {

@@ -56,7 +56,9 @@ QQ 用户 ──消息──▶ QQ 开放平台 ──WebSocket 事件──▶ 
 - 一个线程同一时间只能属于一个 QQ 会话；任务进行中不能切换，需要先 `/stop`。
 
 - 群里需要 @机器人。默认全群共用一个会话（`QQ_GROUP_SESSION=shared`），每条消息会带上发送者标记。改成 `user` 后，群里每人各用一个会话。
-- 用户发来的图片会下载后交给 Codex 看图；文件会存到 `data/attachments/`，并把本地路径告诉 Codex；语音使用平台的语音识别文字。
+- 识图：直接发图片，可以同时带上文字（例如「图里写了什么」）。图片会下载到 `data/attachments/` 交给 Codex 看。其他文件也存到这个目录，并把本地路径告诉 Codex；语音使用平台的语音识别文字。
+- 发图片：让 Codex 画图表、截图时，它会在回复里写 `![说明](图片路径)`。程序把这段换成「[图片：说明]」，文字发完后再把图片一张张发过来。支持 png / jpg / gif / webp，单张不超过 5MB，一次最多 3 张；发不出去时会告诉你图片在本机的路径。只支持单聊和群聊，频道里只给出路径。
+- 升级到支持发图片的版本之前创建的会话，Codex 还不知道可以发图片，先发 `/new` 开个新会话。
 - Codex 处理时，单聊会显示“正在输入”，中途的进度说明（例如“我先看看目录结构”）也会转发过来，可以用 `QQ_PROGRESS=false` 关闭。
 
 ## 安全须知（请务必看）
@@ -72,6 +74,7 @@ QQ 用户 ──消息──▶ QQ 开放平台 ──WebSocket 事件──▶ 
 - 长回复会自动拆分，每条不超过 1800 字，最多发 5 条；更长的部分完整保存在 `data/replies/`。
 - Markdown：默认先尝试发送 Markdown，机器人没有这个权限时自动改用纯文本，之后不再尝试。
 - 未报备的链接会被平台拦截：程序会把链接里的 `.` 改成 `[.]` 后重新发送。
+- 发图片要先上传：程序用 `file_data`（base64）直接上传，拿到 `file_info` 再发富媒体消息。直接上传的上限是 5MB，更大的图片要用分片上传，目前还不支持。每张图片和文字一样占一次被动回复。
 - 网关断线会自动重连，并恢复会话、补收断线期间的消息；Codex app-server 意外退出后也会自动重启。
 
 ## 开机自启和自动重启
@@ -114,14 +117,15 @@ src/
     token.ts           access_token 获取与自动刷新
     api.ts             OpenAPI（api.bot.qq.com）
     gateway.ts         WebSocket 网关：鉴权、心跳、断线重连与会话恢复
-    sender.ts          发消息：被动/主动切换、Markdown 降级、链接处理、限流重试
+    sender.ts          发消息：被动/主动切换、Markdown 降级、链接处理、限流重试、上传和发送图片
   codex/
     appServer.ts       管理 codex app-server 子进程，处理 JSON-RPC
     protocol.ts        用到的协议类型
   bridge/
     bridge.ts          QQ 消息与 Codex 线程/turn 的桥接、指令处理
     sessions.ts        会话与线程的对应关系（data/sessions.json）
-    attachments.ts     图片和文件下载
+    attachments.ts     收到的图片和文件下载
+    images.ts          从 Codex 回复里找出要发给用户的本机图片
 data/                  运行数据：sessions.json、logs/、attachments/、replies/
 workspace/             Codex 的默认工作目录
 ```

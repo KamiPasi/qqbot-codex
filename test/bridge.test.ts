@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -7,12 +9,22 @@ import { Bridge } from "../src/bridge/bridge.ts";
 import type { CodexAppServer } from "../src/codex/appServer.ts";
 import type { Config } from "../src/config.ts";
 import { configureLogger } from "../src/log.ts";
-import type { MessageSender, ReplyContext } from "../src/qq/sender.ts";
+import type { QQApi } from "../src/qq/api.ts";
+import { MessageSender, type ReplyContext } from "../src/qq/sender.ts";
+import { FakeQQApi } from "./fakeQQApi.ts";
 
 configureLogger({ level: "error" });
 
+/** 1×1 的 PNG */
+const PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64",
+);
+
 class FakeCodex {
   generation = 1;
+  /** thread/start、thread/resume 返回的工作目录；不设置时是假的 /w/线程ID */
+  cwd: string | undefined;
   calls: Array<{ method: string; params: any }> = [];
   #handlers: Array<(method: string, params: any) => void> = [];
   #turn = 0;
@@ -28,7 +40,13 @@ class FakeCodex {
   async request(method: string, params: any): Promise<unknown> {
     this.calls.push({ method, params });
     const thread = (id: string) => ({ id, name: null, preview: `问题-${id}`, cwd: `/w/${id}`, createdAt: 1, updatedAt: Date.now() / 1000 });
-    const session = (id: string) => ({ thread: thread(id), model: "gpt-test", reasoningEffort: "medium", cwd: `/w/${id}`, sandbox: { type: "x" } });
+    const session = (id: string) => ({
+      thread: thread(id),
+      model: "gpt-test",
+      reasoningEffort: "medium",
+      cwd: this.cwd ?? `/w/${id}`,
+      sandbox: { type: "x" },
+    });
     switch (method) {
       case "thread/start":
         return session(`t${++this.#threads}`);
@@ -69,9 +87,16 @@ class FakeCodex {
 
 class FakeSender {
   sent: Array<{ to: string; text: string }> = [];
+  /** 发送时会失败的图片 */
+  failImages = new Set<string>();
   async send(ctx: ReplyContext, text: string): Promise<boolean> {
     this.sent.push({ to: ctx.msgId ?? "", text });
     return true;
+  }
+  /** 图片也记在 sent 里，方便检查和文字的先后顺序 */
+  async sendImage(ctx: ReplyContext, file: string): Promise<void> {
+    if (this.failImages.has(file)) throw new Error("上传失败");
+    this.sent.push({ to: ctx.msgId ?? "", text: `<图片 ${file}>` });
   }
   async sendTyping(): Promise<void> {}
   texts(): string[] {
@@ -87,7 +112,8 @@ async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
   }
 }
 
-function setup() {
+/** 默认用 FakeSender；也可以传入真正的 MessageSender（配合 FakeQQApi）测到 QQ 接口这一层 */
+function setup<S extends object = FakeSender>(sender: S = new FakeSender() as unknown as S) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qqbot-test-"));
   const config: Config = {
     rootDir: dir,
@@ -111,16 +137,21 @@ function setup() {
     codex: { cwd: dir, approvalPolicy: "never", extraInstructions: "", maxConcurrent: 2, turnTimeoutMs: 60_000 },
   };
   const codex = new FakeCodex();
-  const sender = new FakeSender();
   const bridge = new Bridge({
     config,
     codex: codex as unknown as CodexAppServer,
     sender: sender as unknown as MessageSender,
   });
-  return { codex, sender, bridge };
+  return { codex, sender, bridge, dir };
 }
 
 const c2c = (id: string, user: string, content: string) => ["C2C_MESSAGE_CREATE", { id, author: { user_openid: user }, content }] as const;
+
+/** Codex 给出最终回答并结束本轮 */
+function finishTurn(codex: FakeCodex, threadId: string, turnId: string, text: string): void {
+  codex.emit("item/completed", { threadId, turnId, item: { type: "agentMessage", id: `${turnId}-a`, text, phase: "final_answer" } });
+  codex.emit("turn/completed", { threadId, turn: { id: turnId, status: "completed", error: null, items: [] } });
+}
 
 test("单聊：新建线程、转发进度和最终回答", async () => {
   const { codex, sender, bridge } = setup();
@@ -128,6 +159,7 @@ test("单聊：新建线程、转发进度和最终回答", async () => {
   await waitFor(() => codex.count("turn/start") === 1);
   const start = codex.calls.find((c) => c.method === "thread/start")!;
   assert.match(start.params.developerInstructions, /QQ/);
+  assert.match(start.params.developerInstructions, /`!\[说明\]\(图片的绝对路径\)`/);
   assert.equal(codex.calls.find((c) => c.method === "turn/start")!.params.input[0].text, "你好");
 
   codex.emit("item/completed", { threadId: "t1", turnId: "turn1", item: { type: "agentMessage", id: "a", text: "我先看看", phase: "commentary" } });
@@ -273,4 +305,121 @@ test("失败的 turn 会把错误告诉用户", async () => {
   });
   await waitFor(() => sender.sent.length === 1);
   assert.match(sender.texts()[0], /Codex 执行失败：usage limit/);
+});
+
+test("收到图片：下载到 data/attachments，作为 localImage 交给 Codex", async (t) => {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/a.png") {
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.end(PNG);
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const { codex, bridge, dir } = setup();
+  bridge.handleEvent(
+    "C2C_MESSAGE_CREATE",
+    {
+      id: "m1",
+      author: { user_openid: "U1" },
+      content: "图里写了什么",
+      attachments: [
+        { content_type: "image/png", filename: "a.png", url: `${base}/a.png` },
+        { content_type: "image/jpeg", filename: "gone.jpg", url: `${base}/gone.jpg` },
+      ],
+    },
+    "e1",
+  );
+  await waitFor(() => codex.count("turn/start") === 1);
+  const [text, ...images] = codex.calls.find((c) => c.method === "turn/start")!.params.input;
+  assert.equal(images.length, 1);
+  assert.equal(images[0].type, "localImage");
+  assert.equal(path.dirname(images[0].path), path.join(dir, "attachments"));
+  assert.equal(path.extname(images[0].path), ".png");
+  assert.deepEqual(fs.readFileSync(images[0].path), PNG);
+  assert.equal(text.text, `图里写了什么\n[图片已保存到 ${images[0].path}]\n[用户发送了一张图片，但下载失败：HTTP 404]`);
+});
+
+test("回复里引用本机图片：先发文字，再逐张发图片，文字里换成说明", async () => {
+  const { codex, sender, bridge, dir } = setup();
+  codex.cwd = dir;
+  const chart = path.join(dir, "chart.png");
+  const pie = path.join(dir, "out", "pie.jpg");
+  fs.writeFileSync(chart, PNG);
+  fs.mkdirSync(path.dirname(pie));
+  fs.writeFileSync(pie, PNG);
+  bridge.handleEvent(...c2c("m1", "U1", "画两张图"), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  // 相对路径基于 Codex 的工作目录；同一张图只发一次
+  finishTurn(codex, "t1", "turn1", `趋势：\n![销售趋势](${chart})\n占比：![](out/pie.jpg)\n再看一次：![销售趋势](${chart})`);
+  await waitFor(() => sender.sent.length === 3);
+  assert.deepEqual(sender.texts(), [
+    "趋势：\n[图片1：销售趋势]\n占比：[图片2：pie.jpg]\n再看一次：[图片1：销售趋势]",
+    `<图片 ${chart}>`,
+    `<图片 ${pie}>`,
+  ]);
+  assert.ok(sender.sent.every((s) => s.to === "m1"));
+});
+
+test("回复里的图片不存在或发送失败时，在文字里告诉用户文件路径", async () => {
+  const { codex, sender, bridge, dir } = setup();
+  const missing = path.join(dir, "missing.png");
+  const broken = path.join(dir, "broken.png");
+  fs.writeFileSync(broken, PNG);
+  sender.failImages.add(broken);
+  bridge.handleEvent(...c2c("m1", "U1", "画图"), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  finishTurn(codex, "t1", "turn1", `图一：![趋势](${missing})\n图二：![占比](${broken})\n语法是 \`![说明](路径)\``);
+  await waitFor(() => sender.sent.length === 2);
+  assert.deepEqual(sender.texts(), [
+    `图一：[图片「趋势」无法发送：找不到文件 ${missing}]\n图二：[图片：占比]\n语法是 \`![说明](路径)\``,
+    `⚠️ 图片「占比」发送失败（上传失败），文件在本机：${broken}`,
+  ]);
+});
+
+test("回复只有图片时不再单独发文字；频道里只给出图片路径", async () => {
+  const { codex, sender, bridge, dir } = setup();
+  const chart = path.join(dir, "chart.png");
+  fs.writeFileSync(chart, PNG);
+  bridge.handleEvent("GROUP_AT_MESSAGE_CREATE", { id: "g1", group_openid: "G1", author: { member_openid: "M1" }, content: "画图" }, "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  finishTurn(codex, "t1", "turn1", `![趋势](${chart})`);
+  await waitFor(() => sender.sent.length === 1);
+  assert.deepEqual(sender.texts(), [`<图片 ${chart}>`]);
+
+  bridge.handleEvent("AT_MESSAGE_CREATE", { id: "c1", channel_id: "C1", author: { id: "U1" }, content: "<@!42> 画图" }, "e2");
+  await waitFor(() => codex.count("turn/start") === 2);
+  const channelStart = codex.calls.filter((c) => c.method === "thread/start")[1];
+  assert.doesNotMatch(channelStart.params.developerInstructions, /!\[说明\]/);
+  finishTurn(codex, "t2", "turn2", `![趋势](${chart})`);
+  await waitFor(() => sender.sent.length === 2);
+  assert.equal(sender.texts()[1], `[图片「趋势」无法发送：频道里暂不支持发图片，文件在 ${chart}]`);
+});
+
+test("发图片端到端：真正的 MessageSender 先发文字，再上传图片、发 msg_type=7", async () => {
+  const api = new FakeQQApi();
+  const { codex, bridge, dir } = setup(new MessageSender({ api: api as unknown as QQApi, markdown: "off" }));
+  const chart = path.join(dir, "chart.png");
+  fs.writeFileSync(chart, PNG);
+  bridge.handleEvent(...c2c("m1", "U1", "画图"), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  finishTurn(codex, "t1", "turn1", `结果如下：![趋势](${chart})`);
+  await waitFor(() => api.calls.some((c) => c.body.msg_type === 7));
+  const calls = api.calls.filter((c) => c.body.msg_type !== 6); // 去掉“正在输入”
+  assert.deepEqual(
+    calls.map((c) => `${c.method} ${c.target}`),
+    ["sendC2C U1", "uploadC2CFile U1", "sendC2C U1"],
+  );
+  assert.equal(calls[0].body.content, "结果如下：[图片：趋势]");
+  assert.equal(calls[1].body.file_name, "chart.png");
+  assert.deepEqual(Buffer.from(calls[1].body.file_data, "base64"), PNG);
+  assert.deepEqual(calls[2].body.media, { file_info: "info1" });
+  assert.equal(calls[2].body.msg_id, "m1");
 });
