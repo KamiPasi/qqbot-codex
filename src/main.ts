@@ -5,6 +5,7 @@ import { parseEnv } from "node:util";
 import { Bridge } from "./bridge/bridge.ts";
 import { CodexAppServer } from "./codex/appServer.ts";
 import { loadConfig, parseIdList, type Config } from "./config.ts";
+import { disableQuickEdit } from "./console.ts";
 import { acquireInstanceLock } from "./lock.ts";
 import { configureLogger, createLogger } from "./log.ts";
 import { QQApi } from "./qq/api.ts";
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
   if (!checkOnly && !(await acquireInstanceLock(`qqbot-codex-${config.qq.appId}`, config.dataDir))) {
     throw new FatalError("这个机器人已经有一个实例在运行（可能是开机自启的那个），本次不再启动");
   }
+  if (!checkOnly) disableQuickEdit();
 
   const tokens = new AccessTokenManager(config.qq);
   const api = new QQApi({ apiBase: config.qq.apiBase, appId: config.qq.appId, tokens });

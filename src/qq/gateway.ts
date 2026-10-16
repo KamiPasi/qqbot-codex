@@ -96,7 +96,7 @@ export class QQGateway {
     this.#helloTimer = setTimeout(() => {
       if (ws === this.#ws) {
         log.warn("30 秒内没有收到 Hello，重新连接");
-        ws.close(4000, "hello timeout");
+        this.#abandon(ws);
       }
     }, 30_000);
     ws.addEventListener("message", (ev) => this.#onMessage(ws, ev.data));
@@ -141,13 +141,13 @@ export class QQGateway {
         break;
       case OP.RECONNECT:
         log.info("服务端要求重连");
-        ws.close(4000, "reconnect requested");
+        this.#abandon(ws);
         break;
       case OP.INVALID_SESSION:
         log.warn("会话无效，将重新鉴权");
         this.#sessionId = undefined;
         this.#seq = null;
-        ws.close(4000, "invalid session");
+        this.#abandon(ws);
         break;
       default:
         log.debug(`未处理的网关 op=${payload.op}`);
@@ -161,7 +161,7 @@ export class QQGateway {
     } catch (err) {
       if (err instanceof FatalError) return this.#fatal(err.message);
       log.error("获取 access_token 失败", err instanceof Error ? err.message : err);
-      ws.close(4000, "token error");
+      this.#abandon(ws);
       return;
     }
     if (ws !== this.#ws) return;
@@ -205,15 +205,37 @@ export class QQGateway {
     clearInterval(this.#heartbeatTimer);
     this.#ackPending = false;
     this.#heartbeatTimer = setInterval(() => {
-      if (ws !== this.#ws || ws.readyState !== WebSocket.OPEN) return;
+      if (ws !== this.#ws) return;
+      if (ws.readyState !== WebSocket.OPEN) {
+        // 连接已经不能用了，却一直没等到 close 事件（比如走代理时对端断开）
+        log.warn(`网关连接已失效（readyState=${ws.readyState}），重新连接`);
+        this.#abandon(ws);
+        return;
+      }
       if (this.#ackPending) {
         log.warn("心跳无响应，重新连接");
-        ws.close(4000, "heartbeat timeout");
+        this.#abandon(ws);
         return;
       }
       this.#ackPending = true;
       this.#send(ws, { op: OP.HEARTBEAT, d: this.#seq });
     }, interval);
+  }
+
+  /**
+   * 丢弃当前连接并重连，不等关闭握手完成。连接半死时（例如代理那头已经断开），
+   * Node 自带的 WebSocket 可能一直停在 CLOSING、不触发 close 事件，等它就永远重连不上。
+   */
+  #abandon(ws: WebSocket): void {
+    if (ws !== this.#ws) return;
+    this.#ws = undefined;
+    this.#clearTimers();
+    try {
+      ws.close(4000, "reconnect");
+    } catch {
+      // 已经在关闭
+    }
+    this.#scheduleReconnect();
   }
 
   #clearTimers(): void {
