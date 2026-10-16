@@ -1,0 +1,27 @@
+{
+  "name": "qqbot-codex",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把 QQ 官方机器人接到本机 Codex app-server 的 Agent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KamiPasi/qqbot-codex.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "supervise": "node scripts/supervisor.ts",
+    "dev": "node --watch src/main.ts",
+    "check": "node src/main.ts --check",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3"
+  }
+}
