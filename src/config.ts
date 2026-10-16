@@ -25,6 +25,8 @@ export interface Config {
     groupSession: "shared" | "user";
     maxChunkChars: number;
     maxChunks: number;
+    /** 只发了图片/文件、没带文字时，最多等多久的文字说明再一起处理；0 表示不等 */
+    mediaWaitMs: number;
   };
   codex: {
     bin?: string;
@@ -88,10 +90,10 @@ function bool(value: string | undefined, fallback: boolean): boolean {
   return /^(1|true|yes|on)$/i.test(value.trim());
 }
 
-function int(value: string | undefined, fallback: number, name: string): number {
+function int(value: string | undefined, fallback: number, name: string, min = 1): number {
   if (value === undefined || value.trim() === "") return fallback;
   const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} 必须是正数，当前值：${value}`);
+  if (!Number.isFinite(n) || n < min) throw new Error(`${name} 必须是${min > 0 ? "正数" : "不小于 0 的数"}，当前值：${value}`);
   return Math.floor(n);
 }
 
@@ -137,6 +139,7 @@ export function loadConfig(rootDir: string): Config {
       groupSession: oneOf(env.QQ_GROUP_SESSION, ["shared", "user"] as const, "QQ_GROUP_SESSION") ?? "shared",
       maxChunkChars: int(env.QQ_MAX_CHUNK_CHARS, 1800, "QQ_MAX_CHUNK_CHARS"),
       maxChunks: int(env.QQ_MAX_CHUNKS, 5, "QQ_MAX_CHUNKS"),
+      mediaWaitMs: int(env.QQ_MEDIA_WAIT_SEC, 60, "QQ_MEDIA_WAIT_SEC", 0) * 1000,
     },
     codex: {
       bin: env.CODEX_BIN?.trim() || undefined,

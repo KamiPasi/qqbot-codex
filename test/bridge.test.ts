@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { Bridge } from "../src/bridge/bridge.ts";
 import type { CodexAppServer } from "../src/codex/appServer.ts";
 import type { Config } from "../src/config.ts";
@@ -112,8 +112,27 @@ async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
   }
 }
 
+/** 本地 HTTP 服务：/a.png 返回 1×1 的 PNG，其他路径 404 */
+async function serveImage(t: TestContext): Promise<string> {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/a.png") {
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.end(PNG);
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+}
+
 /** 默认用 FakeSender；也可以传入真正的 MessageSender（配合 FakeQQApi）测到 QQ 接口这一层 */
-function setup<S extends object = FakeSender>(sender: S = new FakeSender() as unknown as S) {
+function setup<S extends object = FakeSender>(sender: S = new FakeSender() as unknown as S, qq: Partial<Config["qq"]> = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qqbot-test-"));
   const config: Config = {
     rootDir: dir,
@@ -133,6 +152,8 @@ function setup<S extends object = FakeSender>(sender: S = new FakeSender() as un
       groupSession: "shared",
       maxChunkChars: 1800,
       maxChunks: 5,
+      mediaWaitMs: 0,
+      ...qq,
     },
     codex: { cwd: dir, approvalPolicy: "never", extraInstructions: "", maxConcurrent: 2, turnTimeoutMs: 60_000 },
   };
@@ -146,6 +167,14 @@ function setup<S extends object = FakeSender>(sender: S = new FakeSender() as un
 }
 
 const c2c = (id: string, user: string, content: string) => ["C2C_MESSAGE_CREATE", { id, author: { user_openid: user }, content }] as const;
+/** 只有一张图片、没有文字的单聊消息（手机 QQ 上图文只能分开发） */
+const c2cImage = (id: string, user: string, url: string) =>
+  ["C2C_MESSAGE_CREATE", { id, author: { user_openid: user }, content: "", attachments: [{ content_type: "image/png", url }] }] as const;
+const groupMsg = (id: string, member: string, content: string, imageUrl?: string) =>
+  [
+    "GROUP_AT_MESSAGE_CREATE",
+    { id, group_openid: "G1", author: { member_openid: member }, content, attachments: imageUrl ? [{ content_type: "image/png", url: imageUrl }] : [] },
+  ] as const;
 
 /** Codex 给出最终回答并结束本轮 */
 function finishTurn(codex: FakeCodex, threadId: string, turnId: string, text: string): void {
@@ -231,6 +260,70 @@ test("/stop 中断任务，/new 换新线程", async () => {
   assert.equal(codex.count("thread/start"), 2);
 });
 
+test("/queue：不插进进行中的任务，等它做完后一条一轮依次处理", async () => {
+  const { codex, sender, bridge } = setup();
+  bridge.handleEvent(...c2c("m1", "U1", "第一个任务"), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  bridge.handleEvent(...c2c("m2", "U1", "/queue 第二个任务"), "e2");
+  bridge.handleEvent(...c2c("m3", "U1", "/排队 第三个任务"), "e3");
+  await waitFor(() => sender.sent.length === 2);
+  assert.deepEqual(sender.texts(), ["🕒 已排队（第 1 条），等当前任务做完再处理。", "🕒 已排队（第 2 条），等当前任务做完再处理。"]);
+  bridge.handleEvent(...c2c("m4", "U1", "补充一句"), "e4");
+  await waitFor(() => codex.count("turn/steer") === 1);
+  assert.equal(codex.calls.find((c) => c.method === "turn/steer")!.params.input[0].text, "补充一句", "直接发的照常插进当前任务");
+
+  bridge.handleEvent(...c2c("m5", "U1", "/status"), "e5");
+  await waitFor(() => sender.sent.length === 3);
+  assert.match(sender.texts()[2], /排队中（当前任务做完后依次处理）：2 条\n1\. 第二个任务\n2\. 第三个任务/);
+
+  const starts = () => codex.calls.filter((c) => c.method === "turn/start");
+  finishTurn(codex, "t1", "turn1", "第一个做完了");
+  await waitFor(() => starts().length === 2);
+  assert.equal(starts()[1].params.input[0].text, "第二个任务");
+  assert.equal(starts()[1].params.threadId, "t1", "还在同一个线程里");
+  finishTurn(codex, "t1", "turn2", "第二个做完了");
+  await waitFor(() => starts().length === 3);
+  assert.equal(starts()[2].params.input[0].text, "第三个任务");
+  finishTurn(codex, "t1", "turn3", "第三个做完了");
+  await waitFor(() => sender.sent.length === 6);
+  assert.deepEqual(sender.sent.slice(3), [
+    { to: "m4", text: "第一个做完了" },
+    { to: "m2", text: "第二个做完了" },
+    { to: "m3", text: "第三个做完了" },
+  ]);
+});
+
+test("/queue 不带内容时说明用法；没有要等的任务时直接处理", async () => {
+  const { codex, sender, bridge } = setup();
+  bridge.handleEvent(...c2c("m1", "U1", "/queue"), "e1");
+  await waitFor(() => sender.sent.length === 1);
+  assert.match(sender.texts()[0], /^用法：\/queue 内容/);
+  bridge.handleEvent(...c2c("m2", "U1", "/排队 现在就做"), "e2");
+  await waitFor(() => codex.count("turn/start") === 1);
+  assert.equal(codex.calls.find((c) => c.method === "turn/start")!.params.input[0].text, "现在就做");
+  assert.equal(sender.sent.length, 1, "不回“已排队”");
+});
+
+test("/stop 和 /new 会把排队的消息一起取消", async () => {
+  const { codex, sender, bridge } = setup();
+  bridge.handleEvent(...c2c("m1", "U1", "大任务"), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  bridge.handleEvent(...c2c("m2", "U1", "/queue 下一个"), "e2");
+  bridge.handleEvent(...c2c("m3", "U1", "/stop"), "e3");
+  await waitFor(() => codex.count("turn/interrupt") === 1);
+  codex.emit("turn/completed", { threadId: "t1", turn: { id: "turn1", status: "interrupted", error: null, items: [] } });
+  await waitFor(() => sender.texts().includes("⏹ 已停止当前任务，排队的 1 条消息已取消。"));
+
+  bridge.handleEvent(...c2c("m4", "U1", "又一个大任务"), "e4");
+  await waitFor(() => codex.count("turn/start") === 2);
+  bridge.handleEvent(...c2c("m5", "U1", "/queue 再下一个"), "e5");
+  bridge.handleEvent(...c2c("m6", "U1", "/new"), "e6");
+  await waitFor(() => sender.texts().includes("🆕 已开启新会话，排队的 1 条消息已取消。"));
+  codex.emit("turn/completed", { threadId: "t1", turn: { id: "turn2", status: "interrupted", error: null, items: [] } });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(codex.count("turn/start"), 2, "排队的消息都没有再处理");
+});
+
 test("/threads 列出本会话线程，/switch 切回旧线程并回显上次对话", async () => {
   const { codex, sender, bridge } = setup();
   const finish = (turnId: string, threadId: string) => {
@@ -308,21 +401,7 @@ test("失败的 turn 会把错误告诉用户", async () => {
 });
 
 test("收到图片：下载到 data/attachments，作为 localImage 交给 Codex", async (t) => {
-  const server = http.createServer((req, res) => {
-    if (req.url === "/a.png") {
-      res.writeHead(200, { "Content-Type": "image/png" });
-      res.end(PNG);
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => {
-    server.closeAllConnections();
-    server.close();
-  });
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const base = await serveImage(t);
   const { codex, bridge, dir } = setup();
   bridge.handleEvent(
     "C2C_MESSAGE_CREATE",
@@ -345,6 +424,98 @@ test("收到图片：下载到 data/attachments，作为 localImage 交给 Codex
   assert.equal(path.extname(images[0].path), ".png");
   assert.deepEqual(fs.readFileSync(images[0].path), PNG);
   assert.equal(text.text, `图里写了什么\n[图片已保存到 ${images[0].path}]\n[用户发送了一张图片，但下载失败：HTTP 404]`);
+});
+
+test("先发图片、再发文字：等文字到了才一起交给 Codex，用文字那条消息回复", async (t) => {
+  const base = await serveImage(t);
+  const { codex, sender, bridge } = setup(new FakeSender(), { mediaWaitMs: 5000 });
+  bridge.handleEvent(...c2cImage("m1", "U1", `${base}/a.png`), "e1");
+  bridge.handleEvent(...c2cImage("m2", "U1", `${base}/a.png`), "e2");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(codex.count("turn/start"), 0, "只有图片时先不开始");
+  assert.deepEqual(
+    sender.sent,
+    [{ to: "m1", text: "📎 收到图片，请接着发文字说明，我等你说完一起处理（5 秒内没发就直接看图）。" }],
+    "先回一句，连发的第二张不再回",
+  );
+
+  bridge.handleEvent(...c2c("m3", "U1", "这两张图有什么区别"), "e3");
+  await waitFor(() => codex.count("turn/start") === 1);
+  const [text, ...images] = codex.calls.find((c) => c.method === "turn/start")!.params.input;
+  assert.equal(images.length, 2);
+  assert.ok(images.every((i: { type: string }) => i.type === "localImage"));
+  assert.match(text.text, /^这两张图有什么区别\n\[图片已保存到 /);
+  assert.match(codex.calls.find((c) => c.method === "thread/name/set")!.params.name, /^QQ·这两张图有什么区别/);
+  finishTurn(codex, "t1", "turn1", "差不多");
+  await waitFor(() => sender.sent.length === 2);
+  assert.deepEqual(sender.sent[1], { to: "m3", text: "差不多" });
+});
+
+test("只发图片、一直没有文字：等够时间后直接处理图片", async (t) => {
+  const base = await serveImage(t);
+  const { codex, bridge } = setup(new FakeSender(), { mediaWaitMs: 100 });
+  bridge.handleEvent(...c2cImage("m1", "U1", `${base}/a.png`), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  const [text, image] = codex.calls.find((c) => c.method === "turn/start")!.params.input;
+  assert.equal(image.type, "localImage");
+  assert.match(text.text, /^\[图片已保存到 /);
+});
+
+test("先发文字、再补图片：图片直接追加给正在处理这句话的任务，不等文字", async (t) => {
+  const base = await serveImage(t);
+  const { codex, bridge } = setup(new FakeSender(), { mediaWaitMs: 5000 });
+  bridge.handleEvent(...c2c("m1", "U1", "帮我看看下面这张图"), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  bridge.handleEvent(...c2cImage("m2", "U1", `${base}/a.png`), "e2");
+  await waitFor(() => codex.count("turn/steer") === 1);
+  assert.equal(codex.calls.find((c) => c.method === "turn/steer")!.params.input[1].type, "localImage");
+});
+
+test("任务进行中先发图片、再用 /queue 发文字：图片跟着文字一起排队", async (t) => {
+  const base = await serveImage(t);
+  const { codex, sender, bridge } = setup(new FakeSender(), { mediaWaitMs: 200 });
+  bridge.handleEvent(...c2c("m1", "U1", "大任务"), "e1");
+  await waitFor(() => codex.count("turn/start") === 1);
+  await new Promise((r) => setTimeout(r, 250)); // 已经不算“刚发完文字再补图片”
+  bridge.handleEvent(...c2cImage("m2", "U1", `${base}/a.png`), "e2");
+  bridge.handleEvent(...c2c("m3", "U1", "/queue 看看这张图"), "e3");
+  await waitFor(() => sender.sent.length === 2);
+  assert.match(sender.texts()[0], /^📎 收到图片，请接着发文字说明（.+）。当前任务还在进行：直接发会一起插进去，用 \/queue 发会一起排队。$/);
+  assert.equal(sender.texts()[1], "🕒 已排队（第 1 条），等当前任务做完再处理。");
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(codex.count("turn/steer"), 0, "图片没有插进当前任务");
+
+  finishTurn(codex, "t1", "turn1", "大任务做完了");
+  await waitFor(() => codex.count("turn/start") === 2);
+  const [text, image] = codex.calls.filter((c) => c.method === "turn/start")[1].params.input;
+  assert.match(text.text, /^看看这张图\n\[图片已保存到 /);
+  assert.equal(image.type, "localImage");
+});
+
+test("/stop 会丢弃还在等文字说明的图片", async () => {
+  const { codex, sender, bridge } = setup(new FakeSender(), { mediaWaitMs: 100 });
+  bridge.handleEvent(...c2cImage("m1", "U1", "http://127.0.0.1:9/a.png"), "e1");
+  bridge.handleEvent(...c2c("m2", "U1", "/stop"), "e2");
+  await waitFor(() => sender.sent.length === 2);
+  assert.equal(sender.texts()[1], "还在等文字说明的 1 个附件已丢弃。");
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(codex.count("turn/start"), 0, "到时间也不会再处理");
+});
+
+test("群聊：图片只和同一个人后面发的文字合并", async (t) => {
+  const base = await serveImage(t);
+  const { codex, sender, bridge } = setup(new FakeSender(), { mediaWaitMs: 5000 });
+  bridge.handleEvent(...groupMsg("g1", "A", "", `${base}/a.png`), "e1");
+  assert.match(sender.texts()[0], /^📎 收到图片，请接着 @我 发文字说明/, "群里提醒要 @机器人");
+  bridge.handleEvent(...groupMsg("g2", "B", "今天几号"), "e2");
+  await waitFor(() => codex.count("turn/start") === 1);
+  assert.equal(codex.calls.find((c) => c.method === "turn/start")!.params.input.length, 1, "B 的问题不带 A 的图片");
+
+  bridge.handleEvent(...groupMsg("g3", "A", "这张图呢"), "e3");
+  await waitFor(() => codex.count("turn/steer") === 1);
+  const [text, image] = codex.calls.find((c) => c.method === "turn/steer")!.params.input;
+  assert.match(text.text, /这张图呢/);
+  assert.equal(image.type, "localImage");
 });
 
 test("回复里引用本机图片：先发文字，再逐张发图片，文字里换成说明", async () => {

@@ -58,6 +58,14 @@ interface Inbound {
   input?: UserInput[];
 }
 
+const attachmentCount = (items: Inbound[]) => items.reduce((n, m) => n + m.attachments.length, 0);
+
+/** 把暂存的几条消息并成一条：文字和回复上下文用最后一条，附件按发送顺序合在一起。 */
+function mergeInbound(items: Inbound[]): Inbound {
+  const last = items[items.length - 1];
+  return items.length === 1 ? last : { ...last, attachments: items.flatMap((m) => m.attachments) };
+}
+
 interface Conversation {
   key: string;
   scene: Scene;
@@ -77,7 +85,12 @@ interface Conversation {
   listing?: string[];
   run?: TurnRun;
   starting: boolean;
+  /** 没能追加给进行中任务的普通消息，下一轮一起处理 */
   queue: Inbound[];
+  /** 用 /queue 发的消息：不追加给进行中的任务，等它做完后一条一轮依次处理 */
+  later: Inbound[];
+  /** 只发了附件、还在等文字说明的消息，按发送者分开 */
+  held: Map<string, { items: Inbound[]; timer: NodeJS.Timeout }>;
   /** 下一次回复前要附带的提示 */
   notice?: string;
   idleTimer?: NodeJS.Timeout;
@@ -106,6 +119,10 @@ class TurnRun {
   /** 被 /new 打断的任务，结束时不再发任何消息 */
   silent = false;
   timedOut = false;
+  /** /stop 时顺带取消了什么，附在“已停止”后面 */
+  stopNote = "";
+  /** 最近一条交给本轮的消息是谁、什么时候发的（判断图片是不是在补充刚发的文字） */
+  lastInput?: { senderId: string; receivedAt: number };
   timers: NodeJS.Timeout[] = [];
   sendChain: Promise<void> = Promise.resolve();
 
@@ -143,6 +160,8 @@ const COMMAND_ALIASES: Record<string, string> = {
   resume: "switch",
   切换: "switch",
   模型: "model",
+  排队: "queue",
+  later: "queue",
 };
 
 function parseCommand(text: string): { name: string; args: string } | undefined {
@@ -152,7 +171,7 @@ function parseCommand(text: string): { name: string; args: string } | undefined 
   return { name: COMMAND_ALIASES[name] ?? name, args: m[2].trim() };
 }
 
-const KNOWN_COMMANDS = ["help", "new", "threads", "switch", "stop", "status", "model", "effort", "cwd", "whoami"];
+const KNOWN_COMMANDS = ["help", "new", "threads", "switch", "stop", "queue", "status", "model", "effort", "cwd", "whoami"];
 
 /** 编辑距离（相邻字母对调算 1 步） */
 function editDistance(a: string, b: string): number {
@@ -233,15 +252,16 @@ const HELP = [
   "/new [内容]  开启新会话（可直接带上第一句话）",
   "/threads  列出本会话用过的线程（单聊里 /threads all 列出本机全部）",
   "/switch 序号  切换到列表里的线程，接着聊",
-  "/stop  停止当前任务",
+  "/stop  停止当前任务（排队的消息也一起取消）",
+  "/queue 内容  排队：等当前任务做完再处理这条",
   "/status  查看会话状态",
   "/model [名称|default]  查看或切换模型",
   "/effort [强度|default]  查看或切换推理强度",
   "/cwd [路径]  查看或切换工作目录",
   "/whoami  查看你的 ID",
   "",
-  "直接发消息就是和 Codex 对话；任务进行中再发消息，会追加给正在执行的任务。",
-  "中文指令也可以：/新会话 /线程 /切换 2 /停止 /状态",
+  "直接发消息就是和 Codex 对话。任务进行中再发消息，会插进正在执行的任务（引导）；想等它做完再处理，就用 /queue 发。",
+  "中文指令也可以：/新会话 /线程 /切换 2 /停止 /排队 /状态",
 ].join("\n");
 
 /** QQ 消息 ⇄ Codex 线程/turn 的桥接 */
@@ -448,7 +468,8 @@ export class Bridge {
       await this.#reply(inb, "请直接输入问题，发送 /help 查看指令。");
       return;
     }
-    await this.#submit(conv, inb);
+    if (this.#holdMedia(conv, inb)) return;
+    await this.#submit(conv, this.#withHeld(conv, inb));
   }
 
   #getConv(key: string, scene: Scene): Conversation {
@@ -464,6 +485,8 @@ export class Bridge {
         history,
         starting: false,
         queue: [],
+        later: [],
+        held: new Map(),
       };
       this.#convs.set(key, conv);
       if (conv.threadId) this.#convByThread.set(conv.threadId, conv);
@@ -490,6 +513,9 @@ export class Bridge {
       case "stop":
         await this.#cmdStop(inb, conv);
         return true;
+      case "queue":
+        await this.#cmdQueue(inb, conv, cmd.args);
+        return true;
       case "status":
         await this.#reply(inb, this.#statusText(conv));
         return true;
@@ -514,26 +540,65 @@ export class Bridge {
       void this.#interrupt(run);
     }
     conv.queue.length = 0;
+    const cancelled = conv.later.splice(0).length; // 排队的消息是接着旧会话说的，不带到新会话
     this.#detachThread(conv);
     log.info(`会话 ${conv.key} 已重置`);
+    const note = cancelled ? `排队的 ${cancelled} 条消息已取消` : "";
     if (args) {
+      if (note) conv.notice = `（${note}）`;
       inb.text = args;
-      await this.#submit(conv, inb);
+      await this.#submit(conv, this.#withHeld(conv, inb));
     } else {
-      await this.#reply(inb, "🆕 已开启新会话。");
+      await this.#reply(inb, note ? `🆕 已开启新会话，${note}。` : "🆕 已开启新会话。");
     }
   }
 
   async #cmdStop(inb: Inbound, conv: Conversation): Promise<void> {
     conv.queue.length = 0;
+    const dropped = this.#dropPending(conv);
     const run = conv.run;
     if (!run || run.silent) {
-      await this.#reply(inb, "当前没有进行中的任务。");
+      await this.#reply(inb, dropped ? `${dropped}。` : "当前没有进行中的任务。");
       return;
     }
     run.ctx = inb.ctx; // “已停止”用这条消息回复
+    run.stopNote = dropped;
     log.info(`用户请求停止 ${conv.key} 的任务`);
     await this.#interrupt(run);
+  }
+
+  /** /queue：不追加给进行中的任务，排在后面，等前面的都做完再单独作为一轮处理。 */
+  async #cmdQueue(inb: Inbound, conv: Conversation, args: string): Promise<void> {
+    if (!args && inb.attachments.length === 0) {
+      const lines = [
+        "用法：/queue 内容（或 /排队 内容）",
+        "任务进行中直接发消息，会插进当前任务；用 /queue 发，会等当前任务做完再单独处理。",
+      ];
+      if (conv.later.length) lines.push("", ...this.#laterLines(conv));
+      await this.#reply(inb, lines.join("\n"));
+      return;
+    }
+    inb.text = args;
+    const msg = this.#withHeld(conv, inb);
+    const busy = (conv.run && !conv.run.silent) || conv.starting || conv.queue.length > 0 || conv.later.length > 0;
+    if (!busy) {
+      await this.#submit(conv, msg); // 没有要等的任务，直接处理
+      return;
+    }
+    conv.later.push(msg);
+    log.info(`已排队，等当前任务做完再处理（${conv.key}，第 ${conv.later.length} 条）`);
+    await this.#reply(inb, `🕒 已排队（第 ${conv.later.length} 条），等当前任务做完再处理。`);
+  }
+
+  /** 排队中的消息，给 /status 和 /queue 看 */
+  #laterLines(conv: Conversation): string[] {
+    return [
+      `排队中（当前任务做完后依次处理）：${conv.later.length} 条`,
+      ...conv.later.map((m, i) => {
+        const extra = m.attachments.length ? ` [附件×${m.attachments.length}]` : "";
+        return `${i + 1}. ${truncate(m.text.replace(/\s+/g, " "), 30) || "（无文字）"}${extra}`;
+      }),
+    ];
   }
 
   async #cmdThreads(inb: Inbound, conv: Conversation, args: string): Promise<void> {
@@ -699,7 +764,10 @@ export class Bridge {
     } else {
       lines.push("状态：空闲");
     }
-    if (conv.queue.length) lines.push(`排队消息：${conv.queue.length} 条`);
+    if (conv.queue.length) lines.push(`待处理消息：${conv.queue.length} 条`);
+    if (conv.later.length) lines.push(...this.#laterLines(conv));
+    const held = [...conv.held.values()].reduce((n, h) => n + attachmentCount(h.items), 0);
+    if (held) lines.push(`等文字说明的附件：${held} 个`);
     lines.push(`全部会话：进行中 ${this.#runs.size} 个，排队 ${this.#limiter.waiting} 个`);
     return lines.join("\n");
   }
@@ -847,6 +915,69 @@ export class Bridge {
     return inb.input;
   }
 
+  /**
+   * 手机 QQ 没法图文一起发，用户常常先发图片、再发文字说明。收到只有附件、没有文字的消息时先暂存起来，
+   * 等同一个人的下一条文字一起处理：直接发的文字就一起追加给进行中的任务（或开始新任务），用 /queue 发的就一起排队；
+   * 等了 QQ_MEDIA_WAIT_SEC 还没有文字，就直接处理附件。
+   * 例外是「先发文字、再补图片」：这个人刚发的文字正在被处理，图片直接追加给当前任务，不用等。
+   */
+  #holdMedia(conv: Conversation, inb: Inbound): boolean {
+    const waitMs = this.#cfg.qq.mediaWaitMs;
+    if (!waitMs || inb.text || inb.attachments.length === 0) return false;
+    if (inb.attachments.some((a) => a.content_type?.toLowerCase() === "voice")) return false; // 语音带识别文字，当作文字
+    const held = conv.held.get(inb.senderId);
+    const last = conv.run && !conv.run.silent ? conv.run.lastInput : undefined;
+    if (!held && last?.senderId === inb.senderId && Date.now() - last.receivedAt < waitMs) return false;
+    clearTimeout(held?.timer);
+    const items = [...(held?.items ?? []), inb];
+    const timer = setTimeout(() => {
+      conv.held.delete(inb.senderId);
+      log.info(`没等到文字说明，直接处理 ${attachmentCount(items)} 个附件（${conv.key}）`);
+      this.#submit(conv, mergeInbound(items)).catch((err) => log.error("处理消息出错", err));
+    }, waitMs);
+    timer.unref();
+    conv.held.set(inb.senderId, { items, timer });
+    log.info(`先暂存附件，等文字说明再一起处理（${conv.key}，最多等 ${Math.round(waitMs / 1000)} 秒）`);
+    if (!held) this.#ackHeld(conv, inb, waitMs); // 连发的后几张不再回
+    return true;
+  }
+
+  /** 暂存附件时先回一句，免得用户以为机器人没收到。 */
+  #ackHeld(conv: Conversation, inb: Inbound, waitMs: number): void {
+    const image = inb.attachments.every((a) => a.content_type?.toLowerCase().startsWith("image"));
+    const ask = inb.scene === "group" || inb.scene === "channel" ? "请接着 @我 发文字说明" : "请接着发文字说明";
+    const timeout = `${Math.round(waitMs / 1000)} 秒内没发就直接${image ? "看图" : "处理"}`;
+    const busy = (conv.run && !conv.run.silent) || conv.starting;
+    const text = busy
+      ? `📎 收到${image ? "图片" : "附件"}，${ask}（${timeout}）。当前任务还在进行：直接发会一起插进去，用 /queue 发会一起排队。`
+      : `📎 收到${image ? "图片" : "附件"}，${ask}，我等你说完一起处理（${timeout}）。`;
+    this.#sender.send(inb.ctx, text, { allowActive: false }).catch((err) => log.debug(`发送“收到附件”提示失败：${errText(err)}`));
+  }
+
+  /** 把同一个人暂存的附件并进这条消息；回复用这条消息的上下文，被动回复额度是新的。 */
+  #withHeld(conv: Conversation, inb: Inbound): Inbound {
+    const held = conv.held.get(inb.senderId);
+    if (!held) return inb;
+    clearTimeout(held.timer);
+    conv.held.delete(inb.senderId);
+    return mergeInbound([...held.items, inb]);
+  }
+
+  /** /stop：丢弃排队的消息和暂存的附件，返回给用户的说明（什么都没丢时为空）。 */
+  #dropPending(conv: Conversation): string {
+    const queued = conv.later.splice(0).length;
+    let held = 0;
+    for (const h of conv.held.values()) {
+      clearTimeout(h.timer);
+      held += attachmentCount(h.items);
+    }
+    conv.held.clear();
+    const parts: string[] = [];
+    if (queued) parts.push(`排队的 ${queued} 条消息已取消`);
+    if (held) parts.push(`还在等文字说明的 ${held} 个附件已丢弃`);
+    return parts.join("，");
+  }
+
   async #submit(conv: Conversation, inb: Inbound): Promise<void> {
     const run = conv.run;
     if (run && run.turnId && !run.finished && !run.silent) {
@@ -867,15 +998,17 @@ export class Bridge {
       return false;
     }
     run.ctx = inb.ctx;
+    run.lastInput = { senderId: inb.senderId, receivedAt: inb.ctx.receivedAt };
     log.info(`已把新消息追加到进行中的任务（${run.conv.key}）`);
     void this.#sender.sendTyping(inb.ctx);
     return true;
   }
 
   #pump(conv: Conversation): void {
-    if (conv.run || conv.starting || conv.queue.length === 0) return;
-    const batch = conv.queue.splice(0);
-    this.#startTurn(conv, batch).catch((err) => log.error("启动任务出错", err));
+    if (conv.run || conv.starting) return;
+    // 没能追加进去的普通消息先处理；/queue 的消息一条一轮
+    const batch = conv.queue.length ? conv.queue.splice(0) : conv.later.splice(0, 1);
+    if (batch.length) this.#startTurn(conv, batch).catch((err) => log.error("启动任务出错", err));
   }
 
   #threadPolicy(): { sandbox?: string; approvalPolicy: string } {
@@ -967,6 +1100,7 @@ export class Bridge {
       const threadId = await this.#ensureThread(conv, last.scene, first.text || (first.attachments.length ? "附件" : ""));
       const input = (await Promise.all(batch.map((m) => this.#inputFor(m)))).flat();
       run = new TurnRun(conv, threadId, last.ctx, release, conv.override.cwd ?? conv.cwd ?? this.#cfg.codex.cwd);
+      run.lastInput = { senderId: last.senderId, receivedAt: last.ctx.receivedAt };
       conv.run = run;
       this.#runs.set(threadId, run);
       void this.#sender.sendTyping(last.ctx);
@@ -1137,7 +1271,10 @@ export class Bridge {
         if (answer) await this.#sendAnswer(run, answer);
         if (status === "interrupted") {
           const minutes = Math.round(this.#cfg.codex.turnTimeoutMs / 60_000);
-          await this.#sender.send(run.ctx, run.timedOut ? `⏱ 任务超过 ${minutes} 分钟，已自动停止。` : "⏹ 已停止当前任务。");
+          await this.#sender.send(
+            run.ctx,
+            run.timedOut ? `⏱ 任务超过 ${minutes} 分钟，已自动停止。` : `⏹ 已停止当前任务${run.stopNote ? `，${run.stopNote}` : ""}。`,
+          );
         } else {
           const reason = turn?.error?.message || run.errorText || "未知错误";
           await this.#sender.send(run.ctx, `❌ Codex 执行失败：${truncate(reason, 500)}`);
