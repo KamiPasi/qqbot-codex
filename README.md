@@ -64,6 +64,26 @@ QQ 用户 ──消息──▶ QQ 开放平台 ──WebSocket 事件──▶ 
 - 升级到支持发图片的版本之前创建的会话，Codex 还不知道可以发图片，先发 `/new` 开个新会话。
 - Codex 处理时，单聊会显示“正在输入”，中途的进度说明（例如“我先看看目录结构”）也会转发过来，可以用 `QQ_PROGRESS=false` 关闭。
 
+## 主动发消息到 QQ（qq-notify skill）
+
+`scripts/notify.ts` 用机器人的身份把消息主动发到 QQ，机器人进程不用开着。配合 Codex 桌面版的计划任务，可以做定时提醒、监控告警：任务跑完后，Codex 调用这个脚本把结果发到 QQ。
+
+1. 安装 skill：`npm run install-skill`。它会把 `skills/qq-notify/SKILL.md` 复制到 `~/.codex/skills/qq-notify/`（设置了 `CODEX_HOME` 时装到那里），并填好本机脚本的路径。仓库换了位置后，重新运行一次。
+2. 在 Codex 桌面版建计划任务，提示词里点名用 qq-notify，并写清什么时候发。例如「每周五 17:00 用 qq-notify 提醒我交周报」，或者「每个交易日 14:50 查一下 600519 的价格，跌破 1500 元时用 qq-notify 发到 QQ，没跌破就不要发」。
+3. 也可以直接在命令行里用，先加 `--dry-run` 看看会发什么：
+
+```bash
+node scripts/notify.ts "备份完成，共 12 个文件"
+node scripts/notify.ts --image chart.png "今天的销售走势"
+node scripts/notify.ts --file report.md          # 内容多行或带引号时
+node scripts/notify.ts --group <群 ID> "今晚 10 点停机维护"
+```
+
+- 默认发给 `QQ_ALLOWED_USERS` 里唯一的用户，有多个用户时用 `--to` 指定。`--to` 和 `--group` 只能发给白名单里的用户和群。
+- 文字和图片的处理和机器人回复一样：长文字自动分段，图片在文字之后发出，最多 3 张。
+- 发出去的是主动消息：单聊每人每天最多 1000 条、每分钟 20 条。用户在机器人资料卡里关掉「允许主动发送」后就发不出去。
+- 计划任务是 Codex 桌面版的功能，电脑和桌面版都要开着才会运行。每次运行都是完整的一轮模型调用；在固定时刻运行的任务，实际触发时间可能前后偏差几分钟。
+
 ## 安全须知（请务必看）
 
 - **白名单里的人，等于可以让 Codex 在这台电脑上执行命令。** 沙箱默认沿用 `~/.codex/config.toml`；如果那里配置的是 `sandbox_mode = "danger-full-access"` 加 `approval_policy = "never"`，就是完全访问、不需要审批。只把信任的人加进白名单；`QQ_ALLOWED_GROUPS` 会放行整个群，要更谨慎。
@@ -113,9 +133,14 @@ QQ 用户 ──消息──▶ QQ 开放平台 ──WebSocket 事件──▶ 
 start.bat              双击启动（运行守护进程）
 scripts/
   supervisor.ts        守护进程：异常退出自动重启，退出码 2（配置/凭据等问题）时停止
+  notify.ts            把一条消息主动发到 QQ（给 Codex 计划任务、脚本用）
+  install-skill.ts     把 skills/ 下的 skill 装进 ~/.codex/skills
+skills/
+  qq-notify/SKILL.md   Codex skill：让 Codex 用 notify.ts 把结果发到 QQ
 src/
   main.ts              入口：加载配置、自检、启动各模块、白名单热更新
   config.ts            .env 解析
+  notify.ts            notify.ts 的参数解析、分段和发送
   lock.ts              单实例锁（命名管道），防止同一个机器人重复运行
   console.ts           关掉 Windows 控制台的快速编辑，避免点一下窗口机器人就被挂起
   qq/

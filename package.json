@@ -17,6 +17,8 @@
     "supervise": "node scripts/supervisor.ts",
     "dev": "node --watch src/main.ts",
     "check": "node src/main.ts --check",
+    "notify": "node scripts/notify.ts",
+    "install-skill": "node scripts/install-skill.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.ts"
   },

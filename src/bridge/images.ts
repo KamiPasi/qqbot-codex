@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** 能发到 QQ 的图片格式 */
-const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+export const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
 
 /** Markdown 图片 ![说明](路径)；路径里允许一层成对的括号，例如 Program Files (x86) */
 const IMAGE_MD = /!\[([^\]\n]*)\]\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
